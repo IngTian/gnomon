@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# Pre-commit hook: vault lint on staged concept notes.
+#
+# Enforces the shape required by Concepts/CLAUDE.md (and consolidated in
+# Note Standard.md at vault root) on every branch. Checks: [!info] brief,
+# #Type/, #Topic/ matches folder, Property placement, required sections per
+# type, [[wiki-link]] resolution (targets include vault-root .md files, so
+# [[Note Standard]] and [[Plan]] resolve), DAG integrity. No branch-name
+# scoping, no shape-lint for vault-root files, no commit-message lint.
+
+set -euo pipefail
+
+# --- drift-lint: fail if a vendored core-managed file was edited in place ---
+# Runs UNCONDITIONALLY on every commit, before the concept-note early-exit
+# below, so it catches drift even on commits that touch no Concepts/ files.
+# No-op in the core repo itself (no .mentor/ dir there) and in any vault
+# that hasn't synced yet (no .mentor/bin/mentor-drift.mjs) — only active
+# once a vault has vendored the tooling via mentor-sync.
+repo_root="$(git rev-parse --show-toplevel)"
+if [ -f "$repo_root/.mentor/MANIFEST" ] && [ -f "$repo_root/.mentor/bin/mentor-drift.mjs" ]; then
+  if ! node "$repo_root/.mentor/bin/mentor-drift.mjs" "$repo_root"; then
+    echo "error: core-managed file drift detected — edit the core and re-run mentor-sync, don't edit the vendored copy." >&2
+    exit 1
+  fi
+fi
+
+# ---- Vault lint on staged concept notes --------------------------------------
+staged_concepts=()
+while IFS= read -r file; do
+  [[ "$file" =~ ^Concepts/.+\.md$ ]] || continue
+  base="$(basename "$file")"
+  [[ "$base" == "CLAUDE.md" || "$base" == "Index.md" ]] && continue
+  staged_concepts+=("$file")
+done < <(git -c core.quotePath=false diff --cached --name-only --diff-filter=ACMR)
+
+if [ "${#staged_concepts[@]}" -eq 0 ]; then
+  exit 0
+fi
+
+# Build the set of valid wiki-link targets (basenames, no .md) from the working tree.
+# Includes Concepts/, Drills/, and vault-root .md files (Note Standard.md, Plan.md, etc.).
+valid_targets="$( {
+  find Concepts Drills -name '*.md' -type f 2>/dev/null
+  find . -maxdepth 1 -name '*.md' -type f 2>/dev/null
+} | while IFS= read -r p; do basename "$p" .md; done | sort -u)"
+
+# Index of "basename<TAB>path" over the same target set, for Check 7's
+# DAG-integrity lookup — that check needs the *file* behind a wiki-link, not
+# just confirmation that the name exists. Lookup is exact-field via awk rather
+# than grep, because a substring match would let [[Limit]] resolve to
+# "Uniqueness of the Limit".
+target_index="$( {
+  find Concepts Drills -name '*.md' -type f 2>/dev/null
+  find . -maxdepth 1 -name '*.md' -type f 2>/dev/null
+} | while IFS= read -r p; do printf '%s\t%s\n' "$(basename "$p" .md)" "$p"; done | sort -u)"
+
+# note_core_is_empty <path> -- true (exit 0) when the note's *defining* section
+# still holds a '*TODO' draft marker, or is missing outright. Used by Check 7.
+#
+# The test is deliberately narrow: only the section carrying the note's actual
+# content counts ('# Definition' for a Definition, '# Statement' for anything
+# theorem-shaped or an Axiom). A '*TODO' anywhere in the file is the wrong
+# test -- it flags a note with a complete statement and proof whose
+# '# Summary' or '# Examples' merely hasn't been written, which is not a
+# broken dependency. A noisy check gets bypassed, so precision here is
+# load-bearing.
+note_core_is_empty() {
+  local path="$1" t key body
+  t="$(grep -oE '#Type/[A-Za-z]+' "$path" | head -1 | sed 's|#Type/||' || true)"
+  case "$t" in
+    Definition)                                  key='# Definition' ;;
+    Theorem|Lemma|Proposition|Property|Axiom)    key='# Statement'  ;;
+    *) return 1 ;;   # untyped or unrecognized -- Check 2 / Check 5's business
+  esac
+  grep -qF "$key" "$path" || return 0
+  body="$(awk -v k="$key" '$0 == k { inside=1; next } /^# / { inside=0 } inside { print }' "$path")"
+  grep -qF '*TODO' <<< "$body"
+}
+
+violations=()
+
+for f in "${staged_concepts[@]}"; do
+  # Skip deletions — staged delete won't exist in working tree
+  [ -f "$f" ] || continue
+
+  rel_path="${f#Concepts/}"
+  topic_folder="${rel_path%%/*}"
+  topic_tag_expected="${topic_folder// /}"
+
+  # Check 1: [!info] brief in the first 5 lines
+  if ! head -5 "$f" | grep -q '^> \[!info\]'; then
+    violations+=("$f: missing '> [!info]' brief callout in the first 5 lines")
+  fi
+
+  # Check 2: #Type/ tag present (skip downstream checks if absent)
+  if ! grep -q '#Type/[A-Za-z]' "$f"; then
+    violations+=("$f: missing #Type/ tag")
+    continue
+  fi
+
+  type="$(grep -oE '#Type/[A-Za-z]+' "$f" | head -1 | sed 's|#Type/||' || true)"
+
+  # Check 3: #Topic/ first segment matches folder (spaces stripped)
+  topic_actual="$(grep -oE '#Topic/[A-Za-z]+' "$f" | head -1 | sed 's|#Topic/||' || true)"
+  if [ -z "$topic_actual" ]; then
+    violations+=("$f: missing #Topic/ tag")
+  elif [ "$topic_actual" != "$topic_tag_expected" ]; then
+    violations+=("$f: #Topic/$topic_actual does not match folder Concepts/$topic_folder/ (expected #Topic/$topic_tag_expected)")
+  fi
+
+  # Check 4: Property placement
+  if [ "$type" = "Property" ] && [[ "$f" != *"/Properties/"* ]]; then
+    violations+=("$f: #Type/Property note must live in a Properties/ subfolder")
+  fi
+
+  # Check 5: required sections per type
+  case "$type" in
+    Definition)
+      for section in '# Intuition' '# Definition' '# Examples'; do
+        grep -qF "$section" "$f" || violations+=("$f: missing required section '$section' (Definition)")
+      done
+      ;;
+    Theorem|Lemma|Proposition|Property)
+      for section in '# Summary' '# Statement' '# Proof' '# Examples'; do
+        grep -qF "$section" "$f" || violations+=("$f: missing required section '$section' ($type)")
+      done
+      ;;
+    Axiom)
+      # An axiom is assumed, not derived, so '# Proof' is replaced by
+      # '# Independence' — the structure in which the axiom FAILS, which is
+      # what shows it isn't free. See Note Standard.md § 1.1 and § 2.4.
+      for section in '# Summary' '# Statement' '# Independence' '# Examples'; do
+        grep -qF "$section" "$f" || violations+=("$f: missing required section '$section' ($type)")
+      done
+      if grep -qF '# Proof' "$f"; then
+        violations+=("$f: #Type/Axiom must not have a '# Proof' section — an axiom is assumed, not derived (use '# Independence')")
+      fi
+      ;;
+    *)
+      violations+=("$f: unrecognized #Type/$type — no shape rule defined (see Note Standard.md § 1)")
+      ;;
+  esac
+
+  # Check 6: wiki-links resolve to a note in Concepts/, Drills/, or vault-root.
+  # Strip image/asset embeds (![[foo.png]]) first — those aren't note links.
+  wikilinks="$(sed 's/!\[\[[^]]*\]\]//g' "$f" | grep -oE '\[\[[^]]+\]\]' | sed 's/^\[\[//;s/\]\]$//' || true)"
+  if [ -n "$wikilinks" ]; then
+    while IFS= read -r link; do
+      [ -z "$link" ] && continue
+      target="${link%%|*}"              # strip |alias
+      target="${target%%#*}"            # strip #section
+      basename_target="${target##*/}"   # handle folder-qualified form
+      if ! grep -qxF "$basename_target" <<< "$valid_targets"; then
+        violations+=("$f: unresolved [[$link]] — no matching note in Concepts/, Drills/, or vault root")
+      fi
+    done <<< "$wikilinks"
+  fi
+
+  # Check 7: DAG integrity — a written note must not depend on an unwritten one.
+  #
+  # Check 6 verifies that a wiki-link *resolves*; it never verifies the target
+  # has any content, so a finished theorem could rest on an empty stub for
+  # months and nothing would complain. Resolution and substance are different
+  # properties and only one was being checked. See Note Standard.md
+  # § 5 (knowledge-DAG protocol) and § 11.
+  #
+  # "Unwritten" is note_core_is_empty above — the *defining* section is still a
+  # TODO — not merely "the file contains a TODO somewhere". An unwritten note is
+  # allowed to depend on an unwritten note (that is ordinary top-down
+  # scaffolding), so this fires only when something finished leans on something
+  # empty. It is therefore forward-looking rather than retroactive: a
+  # pre-existing violation surfaces the next time its note is edited, not as a
+  # wall of failures on the commit that introduces the rule.
+  #
+  # Only the brief's 'Depends On:' line is scanned. 'Generalization:' and
+  # 'Properties:' are deliberately excluded — a note may legitimately point at
+  # a planned generalization or list properties still being authored;
+  # 'Depends On:' is the one field asserting "this note's correctness rests on
+  # that one."
+  if ! note_core_is_empty "$f"; then
+    depends_line="$(grep -m1 '^> \*\*Depends On:\*\*' "$f" || true)"
+    if [ -n "$depends_line" ]; then
+      dep_links="$(grep -oE '\[\[[^]]+\]\]' <<< "$depends_line" | sed 's/^\[\[//;s/\]\]$//' || true)"
+      if [ -n "$dep_links" ]; then
+        while IFS= read -r link; do
+          [ -z "$link" ] && continue
+          dep="${link%%|*}"              # strip |alias
+          dep="${dep%%#*}"               # strip #section
+          dep="${dep##*/}"               # handle folder-qualified form
+          dep_path="$(awk -F'\t' -v d="$dep" '$1 == d { print $2; exit }' <<< "$target_index")"
+          # Unresolved links are Check 6's business, not ours.
+          [ -n "$dep_path" ] || continue
+          if note_core_is_empty "$dep_path"; then
+            violations+=("$f: Depends On [[$dep]], whose defining section is still a TODO ($dep_path) — write the dependency first, or drop the edge")
+          fi
+        done <<< "$dep_links"
+      fi
+    fi
+  fi
+done
+
+if [ "${#violations[@]}" -gt 0 ]; then
+  echo "error: vault lint found ${#violations[@]} violation(s) in staged concept notes:" >&2
+  echo >&2
+  for v in "${violations[@]}"; do
+    echo "  $v" >&2
+  done
+  echo >&2
+  echo "Fix them and re-stage. Use 'git commit --no-verify' to bypass (discouraged)." >&2
+  exit 1
+fi
+
+exit 0

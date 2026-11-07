@@ -1,0 +1,8 @@
+# core-managed files: <core source>	<vault-relative destination>
+core/CLAUDE.md	CLAUDE.md
+core/Concepts.CLAUDE.md	Concepts/CLAUDE.md
+core/Drills.CLAUDE.md	Drills/CLAUDE.md
+core/Note-Standard.md	Note Standard.md
+core/.githooks/pre-commit	.githooks/pre-commit
+# commands are expanded by the sync tool (whole subtree):
+core/.claude/commands	.claude/commands
